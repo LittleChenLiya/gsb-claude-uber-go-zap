@@ -124,6 +124,32 @@ func SamplerHook(hook func(entry Entry, dec SamplingDecision)) SamplerOption {
 	})
 }
 
+// SamplerClock sets the clock used by the sampler to define tick boundaries.
+//
+// By default (when this option is not used, or the clock is nil) the sampler
+// buckets entries using the timestamp attached to each Entry (Entry.Time).
+// Entry timestamps come from a wall clock, which can be stepped backwards by
+// system clock adjustments (for example, an NTP correction). When that
+// happens, a bucket's reset deadline may appear to still lie in the future,
+// so the sampler keeps counting; more subtly, a timestamp in the past can
+// make an expired bucket look fresh, causing the sampler to re-allow the
+// first N entries. Supplying a monotonic clock via SamplerClock makes bucket
+// progression independent of wall-clock adjustments: buckets only advance
+// forwards in time and a backwards adjustment can never reset a bucket.
+//
+// The supplied clock must never move backwards. A clock whose readings
+// include a monotonic component (such as the one backing time.Now) or a
+// manually advanced test clock is appropriate. The sampler only reads the
+// clock's current time; it never calls NewTicker.
+//
+// If clock is nil, the sampler falls back to Entry.Time, preserving the
+// default behavior.
+func SamplerClock(clock Clock) SamplerOption {
+	return optionFunc(func(s *sampler) {
+		s.clock = clock
+	})
+}
+
 // NewSamplerWithOptions creates a Core that samples incoming entries, which
 // caps the CPU and I/O load of logging while attempting to preserve a
 // representative subset of your logs.
@@ -172,6 +198,7 @@ type sampler struct {
 	tick              time.Duration
 	first, thereafter uint64
 	hook              func(Entry, SamplingDecision)
+	clock             Clock
 }
 
 var (
@@ -208,7 +235,19 @@ func (s *sampler) With(fields []Field) Core {
 		first:      s.first,
 		thereafter: s.thereafter,
 		hook:       s.hook,
+		clock:      s.clock,
 	}
+}
+
+// runHook invokes the sampling hook without letting a failing hook influence
+// the sampling decision. The hook is observational only: it receives whether
+// the entry was sampled or dropped, but the decision is made before the hook
+// runs and is unaffected by it (including a panic).
+func (s *sampler) runHook(ent Entry, dec SamplingDecision) {
+	defer func() {
+		_ = recover()
+	}()
+	s.hook(ent, dec)
 }
 
 func (s *sampler) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
@@ -218,12 +257,19 @@ func (s *sampler) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
 
 	if ent.Level >= _minLevel && ent.Level <= _maxLevel {
 		counter := s.counts.get(ent.Level, ent.Message)
-		n := counter.IncCheckReset(ent.Time, s.tick)
+		// Use the injected monotonic clock when one is available so that tick
+		// boundaries are immune to wall-clock adjustments. Without a clock we
+		// preserve the historical behavior of bucketing by Entry.Time.
+		now := ent.Time
+		if s.clock != nil {
+			now = s.clock.Now()
+		}
+		n := counter.IncCheckReset(now, s.tick)
 		if n > s.first && (s.thereafter == 0 || (n-s.first)%s.thereafter != 0) {
-			s.hook(ent, LogDropped)
+			s.runHook(ent, LogDropped)
 			return ce
 		}
-		s.hook(ent, LogSampled)
+		s.runHook(ent, LogSampled)
 	}
 	return s.Core.Check(ent, ce)
 }
