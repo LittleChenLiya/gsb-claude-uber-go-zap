@@ -44,6 +44,50 @@ func fakeSampler(lvl LevelEnabler, tick time.Duration, first, thereafter int) (C
 	return core, logs
 }
 
+// controllableClock is a deterministic Clock for sampler tests. Time is fixed
+// and wall-only (no monotonic component), and can be moved freely, including
+// backwards, without any real sleeping.
+type controllableClock struct {
+	mu  sync.RWMutex
+	now time.Time
+}
+
+var _ Clock = (*controllableClock)(nil)
+
+func newControllableClock() *controllableClock {
+	return &controllableClock{
+		// Round(0) drops the monotonic clock reading so backwards movement is
+		// observable through plain wall-time subtraction.
+		now: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Round(0),
+	}
+}
+
+func (c *controllableClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+
+func (c *controllableClock) NewTicker(d time.Duration) *time.Ticker {
+	return time.NewTicker(d)
+}
+
+// add moves the clock forward (or, with a negative duration, backwards).
+func (c *controllableClock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d).Round(0)
+}
+
+// writeEntry reports whether the sampler admitted an entry at the given level.
+func writeEntry(core Core, lvl Level, msg string) bool {
+	if ce := core.Check(Entry{Level: lvl, Message: msg}, nil); ce != nil {
+		ce.Write()
+		return true
+	}
+	return false
+}
+
 func assertSequence(t testing.TB, logs []observer.LoggedEntry, lvl Level, seq ...int64) {
 	seen := make([]int64, len(logs))
 	for i, entry := range logs {
@@ -112,42 +156,153 @@ func TestSamplerDisabledLevels(t *testing.T) {
 }
 
 func TestSamplerTicking(t *testing.T) {
-	// Ensure that we're resetting the sampler's counter every tick.
-	sampler, logs := fakeSampler(DebugLevel, 10*time.Millisecond, 5, 10)
+	// Ensure that we're resetting the sampler's counter every tick. Buckets are
+	// driven by an injected, controllable clock, so this test performs no real
+	// sleeps.
+	tick := 10 * time.Millisecond
+	clock := newControllableClock()
+
+	core, logs := observer.New(DebugLevel)
+	sampler := NewSamplerWithOptions(core, tick, 5, 10, SamplerClock(clock))
 
 	// If we log five or fewer messages every tick, none of them should be
 	// dropped.
-	for tick := 0; tick < 2; tick++ {
+	for bucket := 0; bucket < 2; bucket++ {
 		for i := 1; i <= 5; i++ {
 			writeSequence(sampler, i, InfoLevel)
 		}
-		ztest.Sleep(15 * time.Millisecond)
+		clock.add(tick)
 	}
 	assertSequence(
 		t,
 		logs.TakeAll(),
 		InfoLevel,
-		1, 2, 3, 4, 5, // first tick
-		1, 2, 3, 4, 5, // second tick
+		1, 2, 3, 4, 5, // first bucket
+		1, 2, 3, 4, 5, // second bucket
 	)
 
 	// If we log quickly, we should drop some logs. The first five statements
 	// each tick should be logged, then every tenth.
-	for tick := 0; tick < 3; tick++ {
+	for bucket := 0; bucket < 3; bucket++ {
 		for i := 1; i < 18; i++ {
 			writeSequence(sampler, i, InfoLevel)
 		}
-		ztest.Sleep(10 * time.Millisecond)
+		clock.add(tick)
 	}
 
 	assertSequence(
 		t,
 		logs.TakeAll(),
 		InfoLevel,
-		1, 2, 3, 4, 5, 15, // first tick
-		1, 2, 3, 4, 5, 15, // second tick
-		1, 2, 3, 4, 5, 15, // third tick
+		1, 2, 3, 4, 5, 15, // first bucket
+		1, 2, 3, 4, 5, 15, // second bucket
+		1, 2, 3, 4, 5, 15, // third bucket
 	)
+}
+
+// TestSamplerClockRollbackAndNewBucket verifies the core acceptance criteria:
+// the first N entries in a bucket are admitted, subsequent entries follow the
+// sampling frequency, a virtual rollback of the clock does not reset the
+// counts, and only advancing into a genuinely new bucket clears them.
+func TestSamplerClockRollbackAndNewBucket(t *testing.T) {
+	const tick = time.Second
+	clock := newControllableClock()
+
+	var cc countingCore
+	sampler := NewSamplerWithOptions(&cc, tick, 2, 3, SamplerClock(clock))
+
+	check := func(msg string, want bool) {
+		t.Helper()
+		assert.Equal(t, want, writeEntry(sampler, InfoLevel, msg),
+			"unexpected decision for message %q", msg)
+	}
+
+	// First bucket: first two pass, then every third (n = 5, 8, ...).
+	check("m", true)  // n=1
+	check("m", true)  // n=2
+	check("m", false) // n=3
+	check("m", false) // n=4
+	check("m", true)  // n=5
+	check("m", false) // n=6
+	check("m", false) // n=7
+	check("m", true)  // n=8
+
+	// Move the wall clock backwards within the same tick. The in-progress
+	// bucket's counts must survive: the first two entries are not let through
+	// again.
+	clock.add(-tick)
+	check("m", false) // n=9
+	check("m", false) // n=10
+	check("m", true)  // n=11
+
+	// Moving forward again, but not past the original bucket boundary, must
+	// still be the same bucket.
+	clock.add(tick / 2)
+	check("m", false) // n=12
+
+	// Advance to a genuinely new bucket: counts start over.
+	clock.add(2 * tick)
+	check("m", true)  // n=1 in new bucket
+	check("m", true)  // n=2 in new bucket
+	check("m", false) // n=3 in new bucket
+}
+
+// TestSamplerClockIndependentLevels verifies that two levels each get their
+// own quota and neither crowds the other out, both in the same bucket and
+// after a bucket change.
+func TestSamplerClockIndependentLevels(t *testing.T) {
+	const tick = time.Second
+	clock := newControllableClock()
+
+	var cc countingCore
+	sampler := NewSamplerWithOptions(&cc, tick, 2, 3, SamplerClock(clock))
+
+	check := func(lvl Level, want bool) {
+		t.Helper()
+		assert.Equal(t, want, writeEntry(sampler, lvl, "m"),
+			"unexpected decision at level %v", lvl)
+	}
+
+	// Each level independently admits its first two entries.
+	check(InfoLevel, true)
+	check(WarnLevel, true)
+	check(InfoLevel, true)
+	check(WarnLevel, true)
+	// n=3 for each: dropped for both.
+	check(InfoLevel, false)
+	check(WarnLevel, false)
+	// n=4 for each: dropped.
+	check(InfoLevel, false)
+	check(WarnLevel, false)
+	// n=5 for each: every third after the first two is admitted.
+	check(InfoLevel, true)
+	check(WarnLevel, true)
+
+	// A new bucket resets both levels independently.
+	clock.add(tick)
+	check(InfoLevel, true)
+	check(WarnLevel, true)
+}
+
+// TestSamplerHookPanicDoesNotChangeDecision verifies that a panicking
+// observation callback is recovered from and does not alter the sampling
+// result, whether the entry is sampled or dropped.
+func TestSamplerHookPanicDoesNotChangeDecision(t *testing.T) {
+	clock := newControllableClock()
+	var cc countingCore
+	panickingHook := func(Entry, SamplingDecision) { panic("boom") }
+	sampler := NewSamplerWithOptions(
+		&cc, time.Second, 1, 0, SamplerClock(clock),
+		SamplerHook(panickingHook),
+	)
+
+	assert.NotPanics(t, func() {
+		assert.True(t, writeEntry(sampler, InfoLevel, "first"))
+		// thereafter == 0: everything after the first entry in this bucket is
+		// dropped, and the hook panics again without unwinding us.
+		assert.False(t, writeEntry(sampler, InfoLevel, "first"))
+	})
+	assert.Equal(t, uint32(1), cc.logs.Load())
 }
 
 type countingCore struct {
@@ -191,7 +346,11 @@ func TestSamplerConcurrent(t *testing.T) {
 	cc := &countingCore{}
 
 	hook, dropped, sampled := makeSamplerCountingHook()
-	sampler := NewSamplerWithOptions(cc, tick, logsPerTick, 100000, SamplerHook(hook))
+	sampler := NewSamplerWithOptions(
+		cc, tick, logsPerTick, 100000,
+		SamplerHook(hook),
+		SamplerClock(clock),
+	)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -269,6 +428,69 @@ func TestSamplerRaces(t *testing.T) {
 	wg.Wait()
 }
 
+// TestSamplerConcurrentBarrier drives many goroutines through a single frozen
+// bucket using start/done barriers, so the exact number of sampled and dropped
+// events can be checked without any timing or sleeps.
+func TestSamplerConcurrentBarrier(t *testing.T) {
+	const (
+		numGoroutines = 10
+		eventsPerG    = 100
+		first         = 2
+		thereafter    = 3
+
+		totalAttempts = numGoroutines * eventsPerG // 1000
+	)
+
+	// Frozen clock: the bucket never changes during the run.
+	clock := newControllableClock()
+
+	cc := &countingCore{}
+	hook, dropped, sampled := makeSamplerCountingHook()
+	sampler := NewSamplerWithOptions(
+		cc, time.Second, first, thereafter,
+		SamplerClock(clock),
+		SamplerHook(hook),
+	)
+
+	var (
+		wg    sync.WaitGroup
+		ready = make(chan struct{}, numGoroutines) // each g signals readiness
+		start = make(chan struct{})                // start barrier
+	)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start // start barrier: nobody counts until all are ready
+
+			for j := 0; j < eventsPerG; j++ {
+				writeEntry(sampler, InfoLevel, "same-message")
+			}
+		}()
+	}
+
+	// Park on the ready barrier until every goroutine is blocked on start.
+	for i := 0; i < numGoroutines; i++ {
+		<-ready
+	}
+	close(start)
+	wg.Wait()
+
+	// Within one bucket: n=1,2 are admitted and then every 3rd after that
+	// (n=5,8,...,998).
+	wantSampled := first + (1000-first)/thereafter // 2 + 332 = 334
+	wantDropped := totalAttempts - wantSampled     // 666
+
+	assert.Equal(t, wantSampled, int(cc.logs.Load()),
+		"unexpected number of logs written")
+	assert.Equal(t, wantSampled, int(sampled.Load()),
+		"unexpected number of sampled callbacks")
+	assert.Equal(t, wantDropped, int(dropped.Load()),
+		"unexpected number of dropped callbacks")
+}
+
 func TestSamplerUnknownLevels(t *testing.T) {
 	// Prove that out-of-bounds levels don't panic.
 	unknownLevels := []Level{
@@ -292,10 +514,14 @@ func TestSamplerUnknownLevels(t *testing.T) {
 func TestSamplerWithZeroThereafter(t *testing.T) {
 	var counter countingCore
 
-	// Logs two messages per second.
-	sampler := NewSamplerWithOptions(&counter, time.Second, 2, 0)
+	clock := newControllableClock()
 
-	now := time.Now()
+	// Logs two messages per second.
+	sampler := NewSamplerWithOptions(
+		&counter, time.Second, 2, 0, SamplerClock(clock),
+	)
+
+	now := clock.Now()
 
 	for i := 0; i < 1000; i++ {
 		ent := Entry{
@@ -311,7 +537,8 @@ func TestSamplerWithZeroThereafter(t *testing.T) {
 	assert.Equal(t, 2, int(counter.logs.Load()),
 		"Unexpected number of logs")
 
-	now = now.Add(time.Second)
+	// Buckets are driven by the injected clock, not by entry times.
+	clock.add(time.Second)
 
 	for i := 0; i < 1000; i++ {
 		ent := Entry{

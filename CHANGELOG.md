@@ -3,6 +3,15 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+Enhancements:
+* Add `zapcore.SamplerClock` option to inject the clock used by the Sampler.
+  Sampling buckets are derived from elapsed time on the injected clock, so a
+  wall-clock rollback can no longer reset in-progress per-(level, message)
+  counters and let the first N entries through twice. A panicking
+  `zapcore.SamplerHook` is now recovered from and can no longer change the
+  sampling decision.
+
 ## 1.28.0 (27 Apr 2026)
 Enhancements:
 * [#1534][]: Add `zapcore.CheckPreWriteHook` and `CheckedEntry.Before` method for transforming entries before they are written to any Cores.
