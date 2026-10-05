@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
 	"go.uber.org/zap/internal/bufferpool"
@@ -52,6 +53,12 @@ type Logger struct {
 	addStack zapcore.LevelEnabler
 
 	callerSkip int
+
+	// callerSkipPackages is the list of package import paths whose frames
+	// are skipped when selecting the caller. The first frame whose package
+	// does not match any registered path is treated as the business caller.
+	// See AddCallerSkipPackage for details.
+	callerSkipPackages []string
 
 	clock zapcore.Clock
 }
@@ -372,8 +379,11 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 
 	// Adding the caller or stack trace requires capturing the callers of
 	// this function. We'll share information between these two.
+	//
+	// When a caller boundary is registered, we need the full stack to find
+	// the first non-wrapper frame, even if stacktraces are disabled.
 	stackDepth := stacktrace.First
-	if addStack {
+	if addStack || (log.addCaller && len(log.callerSkipPackages) > 0) {
 		stackDepth = stacktrace.Full
 	}
 	stack := stacktrace.Capture(log.callerSkip+callerSkipOffset, stackDepth)
@@ -393,6 +403,22 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 
 	frame, more := stack.Next()
 
+	// If a caller boundary is registered, skip frames whose package matches
+	// a registered wrapper package. The first frame that does not match is
+	// treated as the business caller. This requires caller annotation to be
+	// enabled; otherwise we avoid the extra work of scanning the stack.
+	if log.addCaller && len(log.callerSkipPackages) > 0 {
+		for log.isWrapperPackage(frame.Function) {
+			if !more {
+				// No business frame found; mark the caller undefined.
+				frame = runtime.Frame{}
+				more = false
+				break
+			}
+			frame, more = stack.Next()
+		}
+	}
+
 	if log.addCaller {
 		ce.Caller = zapcore.EntryCaller{
 			Defined:  frame.PC != 0,
@@ -403,7 +429,7 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 		}
 	}
 
-	if addStack {
+	if addStack && frame.PC != 0 {
 		buffer := bufferpool.Get()
 		defer buffer.Free()
 

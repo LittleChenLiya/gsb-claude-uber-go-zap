@@ -111,6 +111,30 @@ func AddCallerSkip(skip int) Option {
 	})
 }
 
+// AddCallerSkipPackage registers package import paths whose frames are
+// skipped when selecting the caller. This is an alternative to AddCallerSkip
+// that does not require guessing the depth of the wrapper stack.
+//
+// When caller annotation is enabled (see AddCaller), zap captures the real
+// runtime stack, expands inline frames via runtime.CallersFrames, and skips
+// every frame whose package path matches a registered wrapper package. The
+// first frame that does not match any registered package is reported as the
+// caller. If no such frame exists, the caller is marked undefined.
+//
+// Package matching is performed at package boundaries: a registered path
+// matches the frame's package path only if they are equal, or if the frame's
+// path is a sub-package of the registered path. This prevents
+// "example.com/foo" from accidentally matching "example.com/foobar".
+//
+// The registered packages are stored on the Logger instance and are inherited
+// by cloned loggers (see WithOptions, With, Named, and Sugar). They have no
+// effect when caller annotation is disabled.
+func AddCallerSkipPackage(pkgs ...string) Option {
+	return optionFunc(func(log *Logger) {
+		log.callerSkipPackages = append(log.callerSkipPackages, pkgs...)
+	})
+}
+
 // AddStacktrace configures the Logger to record a stack trace for all messages at
 // or above a given level.
 func AddStacktrace(lvl zapcore.LevelEnabler) Option {
