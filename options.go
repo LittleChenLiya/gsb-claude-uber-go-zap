@@ -111,6 +111,48 @@ func AddCallerSkip(skip int) Option {
 	})
 }
 
+// WithCallerBoundary registers the given package paths as logging wrappers
+// and enables an explicit caller-boundary policy for this Logger.
+//
+// Instead of guessing wrapper depth with a fixed AddCallerSkip, the Logger
+// walks the real runtime frames at each log call site -- inlined frames
+// included, exactly as runtime.CallersFrames expands them -- skips every
+// frame whose function belongs to a registered wrapper package, and reports
+// the first remaining frame (the business call site) as the caller. When
+// stack traces are enabled, the trace starts at that same frame.
+//
+// Package paths are matched exactly: registering "example.com/user" does
+// not skip frames from "example.com/userX". If no business frame is found,
+// the caller is reported as undefined.
+//
+// The policy belongs to the Logger it is applied to and is inherited by
+// loggers cloned from it (With, Named, WithOptions, Sugar); repeated use of
+// this option is additive and never mutates the parent Logger's policy.
+// When caller annotation is disabled (the default), the policy is inert and
+// causes no additional stack collection. Loggers without this option keep
+// the default AddCallerSkip-based behavior unchanged.
+//
+//	logger := zap.New(core,
+//		zap.AddCaller(),
+//		zap.WithCallerBoundary("example.com/myapp/logwrap"),
+//	)
+func WithCallerBoundary(packagePaths ...string) Option {
+	return optionFunc(func(log *Logger) {
+		// Copy-on-write: the policy belongs to this Logger alone, so
+		// extending it must not affect the Logger it was cloned from.
+		wrappers := make(map[string]struct{}, len(packagePaths))
+		if log.callerBoundary != nil {
+			for p := range log.callerBoundary.wrappers {
+				wrappers[p] = struct{}{}
+			}
+		}
+		for _, p := range packagePaths {
+			wrappers[p] = struct{}{}
+		}
+		log.callerBoundary = &callerBoundary{wrappers: wrappers}
+	})
+}
+
 // AddStacktrace configures the Logger to record a stack trace for all messages at
 // or above a given level.
 func AddStacktrace(lvl zapcore.LevelEnabler) Option {

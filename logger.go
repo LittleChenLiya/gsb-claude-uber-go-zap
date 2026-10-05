@@ -53,8 +53,18 @@ type Logger struct {
 
 	callerSkip int
 
+	// callerBoundary, when non-nil, is the explicit caller-boundary policy
+	// for this Logger (see WithCallerBoundary). It is shared immutably
+	// with clones; options extend it copy-on-write.
+	callerBoundary *callerBoundary
+
 	clock zapcore.Clock
 }
+
+// captureStack is the function used to capture stack traces for caller
+// annotation and stack traces. It's a variable so that tests can count
+// captures.
+var captureStack = stacktrace.Capture
 
 // New constructs a new Logger from the provided zapcore.Core and Options. If
 // the passed zapcore.Core is nil, it falls back to using a no-op
@@ -376,7 +386,21 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 	if addStack {
 		stackDepth = stacktrace.Full
 	}
-	stack := stacktrace.Capture(log.callerSkip+callerSkipOffset, stackDepth)
+
+	// The caller-boundary policy applies only when caller annotation is
+	// enabled; with the caller disabled it must not trigger any extra
+	// stack collection.
+	boundary := log.callerBoundary
+	if !log.addCaller {
+		boundary = nil
+	}
+	if boundary != nil {
+		// Boundary resolution walks real runtime frames until it finds
+		// the first non-wrapper frame, so it needs the full stack.
+		stackDepth = stacktrace.Full
+	}
+
+	stack := captureStack(log.callerSkip+callerSkipOffset, stackDepth)
 	defer stack.Free()
 
 	if stack.Count() == 0 {
@@ -393,9 +417,18 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 
 	frame, more := stack.Next()
 
+	// With an explicit caller-boundary policy, skip frames from the
+	// registered wrapper packages and select the first business frame
+	// instead of trusting a fixed skip depth. If no business frame
+	// exists, the caller is undefined.
+	found := true
+	if boundary != nil {
+		frame, more, found = boundary.firstBusinessFrame(stack, frame, more)
+	}
+
 	if log.addCaller {
 		ce.Caller = zapcore.EntryCaller{
-			Defined:  frame.PC != 0,
+			Defined:  found && frame.PC != 0,
 			PC:       frame.PC,
 			File:     frame.File,
 			Line:     frame.Line,
@@ -410,10 +443,15 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
 		stackfmt := stacktrace.NewFormatter(buffer)
 
 		// We've already extracted the first frame, so format that
-		// separately and defer to stackfmt for the rest.
-		stackfmt.FormatFrame(frame)
-		if more {
-			stackfmt.FormatStack(stack)
+		// separately and defer to stackfmt for the rest. With a boundary
+		// policy this is the business frame, so the stack trace starts at
+		// exactly the reported caller; without a found frame the trace
+		// stays empty, consistent with the undefined caller.
+		if found {
+			stackfmt.FormatFrame(frame)
+			if more {
+				stackfmt.FormatStack(stack)
+			}
 		}
 		ce.Stack = buffer.String()
 	}

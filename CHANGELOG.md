@@ -3,6 +3,19 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+Enhancements:
+* Add `WithCallerBoundary`, an explicit caller-boundary policy. Instead of
+  guessing wrapper depth with a fixed `AddCallerSkip`, the Logger registers
+  wrapper package paths and walks real runtime frames (inlined frames
+  included, as expanded by `runtime.CallersFrames`), skipping registered
+  wrapper packages and reporting the first business frame as the caller.
+  Package paths are matched exactly, the stack trace starts at the same
+  frame as the reported caller, and callers are reported as undefined when
+  no business frame is found. The policy belongs to the Logger it is
+  applied to, is inherited by clones, and collects no stack when caller
+  annotation is disabled. Default `AddCallerSkip` behavior is unchanged.
+
 ## 1.28.0 (27 Apr 2026)
 Enhancements:
 * [#1534][]: Add `zapcore.CheckPreWriteHook` and `CheckedEntry.Before` method for transforming entries before they are written to any Cores.
